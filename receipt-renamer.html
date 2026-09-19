@@ -313,14 +313,31 @@ async function processFile(file, isPdf, id, refs) {
     } else {
       const dataUrl = await fileToDataUrl(file);
       thumbEl.innerHTML = `<img src="${dataUrl}">`;
-      ocrSource = dataUrl;
+      const img = await loadImage(dataUrl);
+      // Upscale small/low-res photos - Tesseract struggles with tiny text, and
+      // phone photos of receipts are often shrunk before upload.
+      let w = img.naturalWidth, h = img.naturalHeight;
+      const longSide = Math.max(w, h);
+      if (longSide > 0 && longSide < 1600) {
+        const scale = 1600 / longSide;
+        w = Math.round(w * scale);
+        h = Math.round(h * scale);
+      }
+      const srcCanvas = document.createElement('canvas');
+      srcCanvas.width = w;
+      srcCanvas.height = h;
+      srcCanvas.getContext('2d').drawImage(img, 0, 0, w, h);
+      ocrSource = srcCanvas;
     }
 
-    statusEl.textContent = 'OCR処理中...';
-    const result = await Tesseract.recognize(ocrSource, 'jpn+eng', {
-      logger: () => {}
-    });
-    const ocrText = result.data.text || '';
+    // Photos are often taken sideways or upside down, which tanks OCR accuracy.
+    // Try all 4 orientations and keep whichever one Tesseract is most confident
+    // about, stopping early once a clearly-good reading is found.
+    const best = await recognizeBestOrientation(ocrSource, statusEl);
+    const ocrText = best.text;
+    if (best.angle !== 0) {
+      thumbEl.style.transform = `rotate(${best.angle}deg)`;
+    }
 
     // Combine every source we have - the text layer/form fields (accurate but
     // may be incomplete) and OCR (covers anything rendered only as an image).
@@ -366,6 +383,69 @@ function fileToDataUrl(file) {
     reader.onerror = reject;
     reader.readAsDataURL(file);
   });
+}
+
+function loadImage(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = src;
+  });
+}
+
+// Returns a new canvas with the source canvas rotated by 0/90/180/270 degrees.
+function rotateCanvas(sourceCanvas, degrees) {
+  if (degrees === 0) return sourceCanvas;
+  const swap = degrees === 90 || degrees === 270;
+  const out = document.createElement('canvas');
+  out.width = swap ? sourceCanvas.height : sourceCanvas.width;
+  out.height = swap ? sourceCanvas.width : sourceCanvas.height;
+  const ctx = out.getContext('2d');
+  ctx.save();
+  if (degrees === 90) {
+    ctx.translate(out.width, 0);
+    ctx.rotate(Math.PI / 2);
+  } else if (degrees === 180) {
+    ctx.translate(out.width, out.height);
+    ctx.rotate(Math.PI);
+  } else if (degrees === 270) {
+    ctx.translate(0, out.height);
+    ctx.rotate(-Math.PI / 2);
+  }
+  ctx.drawImage(sourceCanvas, 0, 0);
+  ctx.restore();
+  return out;
+}
+
+// Receipt photos are often shot sideways or upside down, which badly hurts OCR
+// accuracy. Try every 90-degree orientation and keep whichever one Tesseract is
+// most confident about (stopping early once a clearly-good reading is found,
+// so the common case - an already-upright photo - only costs one OCR pass).
+async function recognizeBestOrientation(sourceCanvas, statusEl) {
+  const angles = [0, 90, 180, 270];
+  let best = null;
+  for (const angle of angles) {
+    if (statusEl) {
+      statusEl.textContent = angle === 0
+        ? 'OCR処理中...'
+        : `OCR処理中...(向きを変えて再試行 ${angle}°)`;
+    }
+    const canvas = rotateCanvas(sourceCanvas, angle);
+    let result;
+    try {
+      result = await Tesseract.recognize(canvas, 'jpn+eng', { logger: () => {} });
+    } catch (e) {
+      continue;
+    }
+    const confidence = result.data.confidence || 0;
+    const text = result.data.text || '';
+    if (!best || confidence > best.confidence) {
+      best = { angle, confidence, text };
+    }
+    if (confidence >= 85) break; // good enough, no need to test the rest
+  }
+  return best || { angle: 0, confidence: 0, text: '' };
 }
 
 // ---- Parsing heuristics ----
@@ -449,10 +529,10 @@ function getAmountCandidates(text, lines) {
     const n = parseInt(m[0].replace(/,/g, ''), 10);
     if (!isNaN(n) && n > 0) results.push(String(n));
   });
-  // Last-resort net: any standalone 3+ digit number not glued to a letter (so
+  // Last-resort net: any standalone 2+ digit number not glued to a letter (so
   // fragments of registration numbers / invoice codes like "T7120001048200"
   // are excluded). Ensures the chip list is rarely empty even on messy OCR.
-  [...text.matchAll(/(?<![A-Za-z0-9])\d{3,}(?![A-Za-z0-9])/g)].forEach(m => {
+  [...text.matchAll(/(?<![A-Za-z0-9])\d{2,}(?![A-Za-z0-9])/g)].forEach(m => {
     const n = parseInt(m[0], 10);
     if (!isNaN(n) && n > 0) results.push(String(n));
   });
