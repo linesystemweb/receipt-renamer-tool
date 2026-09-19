@@ -318,8 +318,8 @@ async function processFile(file, isPdf, id, refs) {
       // phone photos of receipts are often shrunk before upload.
       let w = img.naturalWidth, h = img.naturalHeight;
       const longSide = Math.max(w, h);
-      if (longSide > 0 && longSide < 1600) {
-        const scale = 1600 / longSide;
+      if (longSide > 0 && longSide < 2000) {
+        const scale = 2000 / longSide;
         w = Math.round(w * scale);
         h = Math.round(h * scale);
       }
@@ -329,6 +329,11 @@ async function processFile(file, isPdf, id, refs) {
       srcCanvas.getContext('2d').drawImage(img, 0, 0, w, h);
       ocrSource = srcCanvas;
     }
+
+    // Phone photos of receipts often have shadows, glare, or dim/uneven lighting
+    // that lowers contrast between the text and paper - stretch the contrast
+    // (grayscale + normalize to the full black-white range) to help Tesseract.
+    ocrSource = preprocessForOcr(ocrSource);
 
     // Photos are often taken sideways or upside down, which tanks OCR accuracy.
     // Try all 4 orientations and keep whichever one Tesseract is most confident
@@ -418,6 +423,43 @@ function rotateCanvas(sourceCanvas, degrees) {
   return out;
 }
 
+// Phone photos often have shadows, glare or dim/uneven lighting that lowers the
+// contrast between printed text and paper. Converting to grayscale and stretching
+// the contrast to the full black-white range (without hard binarizing, which can
+// wipe out thin or anti-aliased strokes) gives Tesseract a cleaner image to read.
+function preprocessForOcr(sourceCanvas) {
+  const w = sourceCanvas.width, h = sourceCanvas.height;
+  if (!w || !h) return sourceCanvas;
+  const out = document.createElement('canvas');
+  out.width = w;
+  out.height = h;
+  const ctx = out.getContext('2d');
+  ctx.drawImage(sourceCanvas, 0, 0);
+  let imageData;
+  try {
+    imageData = ctx.getImageData(0, 0, w, h);
+  } catch (e) {
+    // canvas may be tainted (cross-origin) in rare cases - just skip preprocessing
+    return sourceCanvas;
+  }
+  const data = imageData.data;
+  const gray = new Float32Array(w * h);
+  let min = 255, max = 0;
+  for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+    const g = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+    gray[p] = g;
+    if (g < min) min = g;
+    if (g > max) max = g;
+  }
+  const range = Math.max(1, max - min);
+  for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+    const stretched = ((gray[p] - min) / range) * 255;
+    data[i] = data[i + 1] = data[i + 2] = stretched;
+  }
+  ctx.putImageData(imageData, 0, 0);
+  return out;
+}
+
 // Receipt photos are often shot sideways or upside down, which badly hurts OCR
 // accuracy. Try every 90-degree orientation and keep whichever one Tesseract is
 // most confident about (stopping early once a clearly-good reading is found,
@@ -479,7 +521,12 @@ function getAllCandidates(rawText, parsed) {
   return {
     vendor: dedupeWithFirst(parsed.vendor, lines.filter(l => l.length >= 2 && l.length <= 40)),
     date: dedupeWithFirst(parsed.date, getDateCandidates(text)),
-    amount: dedupeWithFirst(parsed.amount, getAmountCandidates(text, lines)),
+    // Amount candidates are ranked by how often each number repeats in the document
+    // (a real total/subtotal is usually printed more than once - e.g. "合計" and the
+    // payment-method line right below it both show the same amount - while stray
+    // OCR misreads of unrelated numbers each show up only once), so the genuinely
+    // correct value tends to float to the top even when the auto-guess is wrong.
+    amount: dedupeWithFirstByFrequency(parsed.amount, getAmountCandidates(text, lines)),
     // 備考 has no dedicated detection logic - offer every recognized line (including
     // short symbol-only fragments, e.g. "※", "軽減税率対象") as a pickable candidate.
     note: dedupeWithFirst(parsed.note, lines.filter(l => l.length >= 1 && l.length <= 40))
@@ -491,6 +538,23 @@ function dedupeWithFirst(first, arr) {
   if (first) result.push(first);
   arr.forEach(v => {
     if (v && !result.includes(v)) result.push(v);
+  });
+  return result.slice(0, 15);
+}
+
+function dedupeWithFirstByFrequency(first, arr) {
+  const counts = new Map();
+  arr.forEach(v => {
+    if (!v) return;
+    counts.set(v, (counts.get(v) || 0) + 1);
+  });
+  const byFrequency = [...counts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([v]) => v);
+  const result = [];
+  if (first) result.push(first);
+  byFrequency.forEach(v => {
+    if (!result.includes(v)) result.push(v);
   });
   return result.slice(0, 15);
 }
