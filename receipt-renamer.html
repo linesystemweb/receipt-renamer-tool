@@ -6,6 +6,7 @@
 <title>レシート自動リネーム</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.0.5/tesseract.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <style>
   :root{
     --bg:#f5f6f8; --card:#ffffff; --border:#e2e4e8; --text:#1f2328; --muted:#6b7280;
@@ -98,6 +99,10 @@
       <div class="hint" style="margin-top:6px;">対応形式: JPG / PNG / PDF（複数選択可）</div>
       <input type="file" id="fileInput" multiple accept="image/*,application/pdf">
     </div>
+    <div id="bulkBar" style="display:none; margin-top:16px; align-items:center; gap:10px; flex-wrap:wrap;">
+      <button class="primary" id="bulkDownload">まとめてダウンロード（ZIP）</button>
+      <span class="hint" id="bulkInfo"></span>
+    </div>
     <div class="queue" id="queue"></div>
   </div>
 
@@ -128,6 +133,67 @@ dropZone.addEventListener('drop', e => {
 fileInput.addEventListener('change', e => handleFiles(e.target.files));
 
 let itemCounter = 0;
+const allItems = []; // { file, downloadBtn }
+
+const bulkBar = document.getElementById('bulkBar');
+const bulkBtn = document.getElementById('bulkDownload');
+const bulkInfo = document.getElementById('bulkInfo');
+
+function refreshBulkBar() {
+  if (!allItems.length) { bulkBar.style.display = 'none'; return; }
+  bulkBar.style.display = 'flex';
+  const ready = allItems.filter(it => !it.downloadBtn.disabled).length;
+  bulkBtn.disabled = ready === 0;
+  bulkInfo.textContent = ready === allItems.length
+    ? `${ready}件を現在のファイル名でZIPにまとめて保存します`
+    : `読み取り完了 ${ready}/${allItems.length}件（完了分のみZIPに含まれます）`;
+}
+
+bulkBtn.addEventListener('click', async () => {
+  const ready = allItems.filter(it => !it.downloadBtn.disabled);
+  if (!ready.length) return;
+  if (typeof JSZip === 'undefined') {
+    alert('ZIP作成ライブラリを読み込めませんでした。個別にダウンロードしてください。');
+    return;
+  }
+  bulkBtn.disabled = true;
+  const original = bulkBtn.textContent;
+  bulkBtn.textContent = 'ZIP作成中...';
+  try {
+    const zip = new JSZip();
+    const used = new Set();
+    for (const it of ready) {
+      let name = it.downloadBtn.dataset.filename || it.file.name;
+      if (used.has(name)) {
+        const dot = name.lastIndexOf('.');
+        const base = dot > 0 ? name.slice(0, dot) : name;
+        const ext = dot > 0 ? name.slice(dot) : '';
+        let n = 2;
+        while (used.has(`${base}_${n}${ext}`)) n++;
+        name = `${base}_${n}${ext}`;
+      }
+      used.add(name);
+      zip.file(name, it.file);
+    }
+    const blob = await zip.generateAsync({ type: 'blob' });
+    const dt = new Date();
+    const stamp = `${dt.getFullYear()}${String(dt.getMonth() + 1).padStart(2, '0')}${String(dt.getDate()).padStart(2, '0')}`;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `レシート_${stamp}.zip`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    console.error(e);
+    alert('ZIPの作成に失敗しました。個別にダウンロードしてください。');
+  } finally {
+    bulkBtn.textContent = original;
+    refreshBulkBar();
+  }
+});
 
 function handleFiles(fileList) {
   Array.from(fileList).forEach(file => addItem(file));
@@ -207,6 +273,9 @@ function addItem(file) {
   const amountChips = el.querySelector(`#${id}-amount-chips`);
   const noteChips = el.querySelector(`#${id}-note-chips`);
   const chipsHint = el.querySelector(`#${id}-chips-hint`);
+
+  allItems.push({ file, downloadBtn });
+  refreshBulkBar();
 
   function updatePreview() {
     const name = buildFilename(vendorInput.value, dateInput.value, amountInput.value, noteInput.value, ext);
@@ -371,13 +440,13 @@ async function processFile(file, isPdf, id, refs) {
       ? '完了・PDF内のテキスト情報とOCRを併用（内容を確認してください）'
       : '完了（内容を確認してください）';
     statusEl.className = 'status done';
-    refs.downloadBtn.disabled = false;
+    refs.downloadBtn.disabled = false; refreshBulkBar();
   } catch (err) {
     console.error(err);
     statusEl.textContent = 'OCR失敗（手動で入力してください）';
     statusEl.className = 'status error';
     refs.updatePreview();
-    refs.downloadBtn.disabled = false;
+    refs.downloadBtn.disabled = false; refreshBulkBar();
   }
 }
 
