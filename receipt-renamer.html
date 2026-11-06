@@ -173,6 +173,7 @@ bulkBtn.addEventListener('click', async () => {
         name = `${base}_${n}${ext}`;
       }
       used.add(name);
+      learnVendor(it.el.dataset.regNo, it.vendorInput.value);
       zip.file(name, it.file);
     }
     const blob = await zip.generateAsync({ type: 'blob' });
@@ -274,7 +275,7 @@ function addItem(file) {
   const noteChips = el.querySelector(`#${id}-note-chips`);
   const chipsHint = el.querySelector(`#${id}-chips-hint`);
 
-  allItems.push({ file, downloadBtn });
+  allItems.push({ file, downloadBtn, el, vendorInput });
   refreshBulkBar();
 
   function updatePreview() {
@@ -291,6 +292,7 @@ function addItem(file) {
 
   downloadBtn.addEventListener('click', () => {
     const filename = downloadBtn.dataset.filename;
+    learnVendor(el.dataset.regNo, vendorInput.value);
     const url = URL.createObjectURL(file);
     const a = document.createElement('a');
     a.href = url;
@@ -326,6 +328,11 @@ function addItem(file) {
     vendorInput, dateInput, amountInput, noteInput, previewEl, downloadBtn, rawEl, updatePreview,
     vendorChips, dateChips, amountChips, noteChips, chipsHint, renderChips
   });
+}
+
+function el_setReg(id, regNo) {
+  const el = document.getElementById(id);
+  if (el) el.dataset.regNo = regNo || '';
 }
 
 async function processFile(file, isPdf, id, refs) {
@@ -425,6 +432,7 @@ async function processFile(file, isPdf, id, refs) {
     // Note stays empty by default (no note is the common case) - the auto-generated
     // note (e.g. "3件合算") is still offered as a one-click chip below, not pre-filled.
     refs.noteInput.value = '';
+    el_setReg(id, parsed.regNo);
     refs.updatePreview();
 
     const candidates = getAllCandidates(text, parsed);
@@ -572,12 +580,60 @@ function parseReceiptText(rawText) {
   const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
   const amountResult = guessAmountWithNote(text, lines);
 
+  const known = detectKnownVendor(text);
   return {
-    vendor: guessVendor(lines),
+    vendor: known.vendor || guessVendor(lines),
     date: guessDate(text),
     amount: amountResult.value,
-    note: amountResult.note
+    note: amountResult.note,
+    regNo: known.regNo
   };
+}
+
+// ---- Known vendors (logo-only stores like Daiso / Seria can't be OCR'd) ----
+// 1) インボイス登録番号 (T + 13 digits) uniquely identifies a company, so it is the most
+//    reliable key. A few are built in; more are LEARNED automatically in this browser:
+//    whenever a file is downloaded, its registration number -> vendor name is remembered.
+// 2) Brand-name aliases are matched against the recognized text as a second chance.
+const KNOWN_REG = {
+  'T4200001013662': 'Seria'
+};
+const KNOWN_BRANDS = [
+  { name: 'Daiso',  re: /daiso|ダイソー|大創産業/i },
+  { name: 'Seria',  re: /seria(?![a-z])|セリア/i },
+  { name: 'キャンドゥ', re: /can\s?do(?![a-z])|キャンドゥ/i }
+];
+
+function loadLearned() {
+  try { return JSON.parse(localStorage.getItem('rr_learned') || '{}'); } catch (e) { return {}; }
+}
+function learnVendor(regNo, vendor) {
+  const v = (vendor || '').trim();
+  if (!regNo || !v) return;
+  try {
+    const m = loadLearned();
+    m[regNo] = v;
+    localStorage.setItem('rr_learned', JSON.stringify(m));
+  } catch (e) { /* storage unavailable - ignore */ }
+}
+
+function detectKnownVendor(rawText) {
+  const compact = toHalfWidth(rawText).replace(/[\s\u3000]+/g, '');
+  const regs = compact.match(/T\d{13}/g) || [];
+  const regNo = regs[0] || '';
+  const table = Object.assign({}, KNOWN_REG, loadLearned()); // learned entries win
+  // exact match, then tolerate up to 2 misread digits (OCR noise / garbled text layer)
+  for (const r of regs) if (table[r]) return { vendor: table[r], regNo: r };
+  for (const key of Object.keys(table)) {
+    for (let i = compact.indexOf('T'); i !== -1 && i + 14 <= compact.length; i = compact.indexOf('T', i + 1)) {
+      const w = compact.substr(i, 14);
+      let miss = 0;
+      for (let k = 1; k < 14 && miss <= 2; k++) if (w[k] !== key[k]) miss++;
+      if (miss <= 2) return { vendor: table[key], regNo: regNo || key };
+    }
+  }
+  for (const b of KNOWN_BRANDS) if (b.re.test(compact)) return { vendor: b.name, regNo };
+  return { vendor: '', regNo };
 }
 
 // Builds click-to-select candidate lists for each field, so a wrong auto-guess
